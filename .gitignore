@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+!SBHarness-build.spec
+.env*
+*.dpapi
+*.log
+credentials.json
+local-state*
+.DS_Store
+Thumbs.db

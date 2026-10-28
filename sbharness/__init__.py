@@ -1,0 +1,1 @@
+"""SB Harness desktop toy."""
