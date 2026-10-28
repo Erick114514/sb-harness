@@ -26,7 +26,9 @@ py -m venv .venv
 - **自动批准安全操作**：工作目录内可约束的文件操作和公开网页请求自动执行；工作目录外文件与命令仍需确认。
 - **完全访问**：应用内现有文件、公开网页和命令操作不逐次询问；命令使用当前 Windows 用户权限，不会提升权限。首次启用会显示风险说明。
 
-网页只允许公开 HTTP(S) 地址，并检查重定向；不会访问本机、私有网络或保留地址。命令没有操作系统级沙箱。停止按钮可以取消正在等待或运行的操作。
+网页只允许公开 HTTP(S) 地址，并在实际连接时固定到通过校验的公网 IP；每次重定向都会重新检查，不访问本机、私有网络或保留地址。自动批准安全文件操作只在已存在的工作目录内执行，不会自动创建缺失目录。命令没有操作系统级沙箱。停止按钮可以取消正在等待或运行的操作。
+
+云端模型的 Base URL 必须使用 HTTPS，避免 API Key 经明文 HTTP 发送；本机回环服务（`localhost`、`127.0.0.1`、`::1`）可使用 HTTP。模型 API 的 HTTP 重定向不会自动跟随。
 
 ## 工具留下的脚印
 
@@ -61,9 +63,10 @@ Skill 使用 `skill.json` 和 `SKILL.md`。导入只读取这两个定义文件�
 .\.venv\Scripts\python.exe run_app.py --self-test
 py -m pip install pyinstaller
 py -m PyInstaller --noconfirm --clean SBHarness-build.spec
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SBHarness.iss
 ```
 
-构建输出为 `dist\SBHarness-Standalone.exe`。请使用项目内的 PyInstaller spec；它包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。当前提供便携式 EXE，不包含 MSI/Inno Setup 安装器。
+PyInstaller 输出为 `dist\SBHarness-Standalone.exe`；安装包还需要 Inno Setup 6 的命令行编译器 ISCC，输出为 `dist\SBHarness-Setup-v0.1.0.exe`。项目的 PyInstaller spec 包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。公开版 Release 同时提供安装程序与便携版；安装程序按当前 Windows 用户安装，不需要管理员权限，不会在卸载时删除用户资料。
 
 ## 许可证
 
