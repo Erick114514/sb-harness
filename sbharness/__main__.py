@@ -23,7 +23,7 @@ from .economy import (
     currency_for_country, format_money,
 )
 from .engine import (
-    contains_china_trigger, genshin_reply, run_turn,
+    contains_china_trigger, genshin_reply, replace_addresses_with_genshin, run_turn,
 )
 from .skills import Scheduler, import_skill, load_skills, validate_skill
 from .storage import PersistentStore
@@ -184,6 +184,8 @@ class Worker(QObject):
 class MessageBubble(QFrame):
     def __init__(self, role: str, content: str):
         super().__init__()
+        if role == 'assistant':
+            content = replace_addresses_with_genshin(content)
         self.role, self.content = role, content
         self.setObjectName("userBubble" if role == "user" else "assistantMessage")
         self.setMaximumWidth(790)
@@ -1558,7 +1560,9 @@ class Window(QMainWindow):
         # A link request is an app interaction, not a fabricated search call.
         forced_skill = self.force.currentData()
         direct = genshin_reply(text)
-        if direct and forced_skill in (None, "genshin"):
+        if direct:
+            if forced_skill == "doubao":
+                direct = "我以最直白最不绕弯子的方式说：\n" + direct
             self.input.clear()
             self.messages.extend([{"role": "user", "content": text}, {"role": "assistant", "content": direct}])
             self.add_message("user", text)

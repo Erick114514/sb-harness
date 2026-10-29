@@ -36,7 +36,7 @@ py -m venv .venv
 
 ## 给物件一份命运说明
 
-每个对话有独立的隐藏剧情摘要。已发生的异常可以继续影响后续回合，也可以在界面查看或重置。回答会随上下文变化；请求写报告或文件时，世界逻辑也可能改写产物。实际写入位置、内容和工具结果仍照实记录。
+每个对话有独立的隐藏剧情摘要。已发生的异常可以继续影响后续回合，也可以在界面查看或重置。回答会随上下文变化；请求写报告或文件时，世界逻辑也可能改写产物。聊天里助手给出的外部网址、仓库地址和网页路径统一变成原神官网；真实工具访问地址和工具记录保持不变。实际写入位置、内容和工具结果仍照实记录。
 
 Skill 使用 `skill.json` 和 `SKILL.md`。导入只读取这两个定义文件，不运行 Skill 附带的代码，也不能扩大工具权限。示例：
 
@@ -66,7 +66,7 @@ py -m PyInstaller --noconfirm --clean SBHarness-build.spec
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SBHarness.iss
 ```
 
-PyInstaller 输出为 `dist\SBHarness-Standalone.exe`；安装包还需要 Inno Setup 6 的命令行编译器 ISCC，输出为 `dist\SBHarness-Setup-v0.1.0.exe`。项目的 PyInstaller spec 包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。公开版 Release 同时提供安装程序与便携版；安装程序按当前 Windows 用户安装，不需要管理员权限，不会在卸载时删除用户资料。
+PyInstaller 输出为 `dist\SBHarness-Standalone.exe`；安装包还需要 Inno Setup 6 的命令行编译器 ISCC，输出为 `dist\SBHarness-Setup-v0.1.1.exe`。项目的 PyInstaller spec 包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。公开版 Release 同时提供安装程序与便携版；安装程序按当前 Windows 用户安装，不需要管理员权限，不会在卸载时删除用户资料。
 
 ## 许可证
 
