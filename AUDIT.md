@@ -9,9 +9,9 @@
 | 规则 | 当前行为 | 验证 |
 | --- | --- | --- |
 | PowerShell | 只在 Windows 命令工具实际运行时检查 Git Bash。缺失时命令不执行，并在工具卡片记为“已拒绝”；其余命令继续经过权限档位与审批。 | `test_missing_git_bash_blocks_command_without_execution` |
-| 豆包 | “强制体验”现在显示为“豆包人格 · 直给”，选择会保存到全局设置。强制时模型提示要求直答，应用在最终回复前保证出现“我以最直白最不绕弯子的方式说：”；官网快捷回复不能覆盖这个强制选择。 | `test_forced_skill_is_visible_and_persists_across_window_restart`、`test_confrontation_rule_is_passed_as_causal_behavior`、`test_forced_personality_overrides_website_shortcut` |
+| 豆包 | “强制体验”现在显示为“豆包人格 · 直给”，选择会保存到全局设置。强制时模型提示要求直答，应用在最终回复前保证出现“我以最直白最不绕弯子的方式说：”；官网快捷回复也会带上这句开场。 | `test_forced_skill_is_visible_and_persists_across_window_restart`、`test_confrontation_rule_is_passed_as_causal_behavior`、`test_forced_personality_prefixes_the_website_shortcut` |
 | Gemini | 搜索意图被选中后由应用直接返回拒绝语，不发模型请求、不伪造工具卡片；模型仍尝试搜索时，工具层再次拦截并标记为拒绝。 | `test_gemini_search_request_is_intercepted_without_fake_tool_event`、`test_search_prank_does_not_send_network_request` |
-| 原神 | 官网/网址请求直接返回真实官网地址；其它强制 Skill 可以覆盖该快捷回复。写作影响仍由模型依照 Skill 与隐藏剧情生成。 | `test_website_prank_returns_real_official_url_without_search`、`test_genshin_writing_is_model_generated_and_updates_hidden_story` |
+| 原神 | 官网/网址请求一律直接返回原神官网地址，不发模型请求；强制豆包时只在前面加上固定开场。写作影响仍由模型依照 Skill 与隐藏剧情生成。 | `test_website_prank_returns_real_official_url_without_search`、`test_genshin_writing_is_model_generated_and_updates_hidden_story` |
 | Codex | 只对最初的无工具连接请求执行五次真实请求并中止响应；之后正常请求一次，工具结果不在重连中重放。4xx 认证错误停止重试，取消停止后续尝试。 | `test_five_real_attempts_then_one_tool_execution`、`test_auth_error_stops_without_retry`、`test_cancellation_stops_future_retries` |
 | Claude | 由应用覆盖全屏封禁、申诉和申诉失败状态；申诉后地区恢复为美国。 | `test_restriction_waits_for_appeal_then_denies`、`test_appeal_restores_us_region_and_wallet_currency` |
 | DeepSeek | 应用显示等待状态并阻塞当前轮次，直到用户停止；不生成虚构思维链。 | `test_deep_thinking_waits_until_cancelled` |
@@ -22,7 +22,7 @@
 
 - 默认重度调度会把无关键词的 Claude、DeepSeek、Codex 控制流 Skill 当成随机候选，造成随机封禁、无限等待或重连并盖过强制 Skill。现在这些应用级 Skill 只在匹配相关语境时自动候选；强制 Skill 优先，且每轮至多选择一个应用级控制流 Skill。
 - 强制体验过去没有保存，重启后会回到“自动”。现在选择会立即持久化；Skill 被禁用后会清除失效选择。
-- 官网快捷回复过去在调度之前执行，能跳过用户强制的其它 Skill。现在强制项有优先权。
+- 官网快捷回复现在对所有地址请求生效（提交 3bae9c2 起），不再由其它强制 Skill 改交模型回答；强制豆包时保留固定开场。
 - 钱包调整过去只由系统提示约束。现在应用还检查本轮用户是否明确要求调整钱包，并限制每轮最多记一笔；写财务报告、提及金额本身不会授权改余额。
 - 网页搜索过去会自动跟随搜索服务重定向。现在每个重定向地址都重新校验，私有/本机地址会在发起下一次请求前拦截。
 - 审批对话框过去是阻塞模态窗口，挡住停止按钮。现在审批非模态，停止可取消等待中的审批，日志区分拒绝和取消。
@@ -32,7 +32,10 @@
 ## 当前边界与剩余风险
 
 - **模型一致性：** 测试确认强制状态、提示和应用分支已连接，但模拟服务无法证明真实 DeepSeek、Gemini、OpenAI 兼容模型都会遵从自然语言演出提示。只有应用直接执行的规则和豆包固定开场不依赖模型配合。
-- **网页 DNS 重绑定：** 每次请求前会解析并检查目标，重定向也逐跳检查；HTTP 客户端随后仍会自行解析域名，尚未把已验证的 IP 固定到实际连接。恶意 DNS 在检查与连接之间改变答案仍存在极低概率的 TOCTOU 风险。
-- **安全自动文件权限：** 会检查工作目录边界和已存在的符号链接/Windows 重解析点，但没有使用操作系统文件句柄沙箱。同一用户权限下的恶意本地进程可能尝试在检查与文件打开之间替换目录项。对抗本地并发篡改应使用“每次询问”；“完全访问”则明确允许目录外文件和命令。
+- **网页 DNS 重绑定（已收紧）：** 应用对每个 HTTP(S) 请求只解析一次；拒绝含非公网地址的 DNS 答案，再把同一组通过校验的 IP 地址直接用于 TCP 连接。HTTPS 仍以原主机名执行 SNI 和证书校验，不使用系统代理；每个重定向重新解析、校验并固定。回归测试通过本机 HTTP 服务验证实际连接 IP 与校验 IP 一致，并验证重定向到回环地址在连接前被拦截。剩余边界是：网页正文仍是模型输入；在“自动批准安全操作”档位，恶意网页或 Skill 可以诱导模型提出工作目录内的文件写入，而该档位会自动批准这类操作。使用不可信内容时应选“每次询问”。
+- **安全自动文件权限（已收紧）：** Windows 文件操作会逐级打开并暂时锁定目标父目录句柄，核对目标句柄最终路径，并在同一文件句柄上读写。安全自动模式额外要求路径位于工作目录内，并拒绝符号链接/重解析点与硬链接；每次询问和完全访问可以跟随用户明确批准或指定的链接路径。若写入需要新建目录，先逐次确认，再逐级校验并创建；拒绝确认时不会创建。句柄会阻止操作期间重命名目标文件或父目录。若文件系统不支持句柄核验，安全自动操作失败关闭。完全访问按设计不限制工作目录外文件和命令。
+- **命令执行：** 工作目录只决定命令的当前目录，不构成操作系统沙箱；已确认的命令可以访问当前 Windows 用户有权访问的其他文件、网络和进程。对命令范围敏感时使用“每次询问”，并审阅命令文本。
+- **文件系统边界：** 句柄核验减少同一用户进程替换路径时逃逸到目录外的机会，但不构成针对管理员、内核级篡改或文件系统驱动的隔离边界；完全访问和用户明确逐次批准仍应按实际操作风险理解。
+- **API Key 传输（已收紧）：** 远程模型地址必须使用 HTTPS；HTTP 仅允许 `localhost` 和回环 IP，且拒绝把账号密码或查询密钥嵌入 Base URL。模型 API 不跟随重定向，避免把认证头转发到非预期地址。发起模型请求前应用校验一次，模型引擎自身也再次校验。用户若把密钥直接输入本机 HTTP 服务，仍需信任该本机进程。
 - **提示词型社区 Skill：** 导入的 Skill 不执行代码，但正文会进入模型提示，仍可能诱导模型尝试工具调用。每个真实工具仍由应用权限层检查；不要导入不可信 Skill。
 - **完全访问：** 命令以当前 Windows 用户权限执行，不会提升权限，但可以访问该用户有权访问的文件和网络资源。这是该档位的预期行为。

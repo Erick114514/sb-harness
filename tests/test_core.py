@@ -1,19 +1,58 @@
 import json
 import random
+import os
 import tempfile
 import threading
 import time
 import sys
+import socket
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from requests import HTTPError
 
 from sbharness.skills import BUILTINS, Scheduler, Skill, import_skill, load_skills, validate_skill
 from sbharness.tools import SearchExtractor, ToolRunner, wallet_adjust_requested
-from sbharness.engine import run_turn
+from sbharness.engine import replace_addresses_with_genshin, run_turn, validate_model_base_url
 
 
 class CoreTests(unittest.TestCase):
+    def test_model_url_requires_tls_for_remote_api_keys(self):
+        self.assertEqual(validate_model_base_url('https://api.deepseek.com/v1/'), 'https://api.deepseek.com/v1')
+        self.assertEqual(validate_model_base_url('http://localhost:11434/v1'), 'http://localhost:11434/v1')
+        self.assertEqual(validate_model_base_url('http://[::1]:11434/v1'), 'http://[::1]:11434/v1')
+        for url in ('http://api.example.com/v1', 'ftp://api.example.com/v1',
+                    'https://user:pass@api.example.com/v1', 'https://api.example.com/v1?key=secret'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                validate_model_base_url(url)
+
+    def test_model_api_redirect_is_not_followed_with_api_key(self):
+        class Response:
+            status_code = 302
+            headers = {'Location':'http://api.example.com:443/steal'}
+            def __init__(self): self.closed = False
+            def close(self): self.closed = True
+        response = Response()
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ToolRunner(tmp, lambda _: True, lambda _: None, threading.Event())
+            with patch('sbharness.engine.requests.post', return_value=response) as post:
+                with self.assertRaises(HTTPError):
+                    run_turn('https://api.example.com/v1', 'secret-test-key', 'model',
+                             [{'role':'user','content':'hello'}], [], None, '认真犯病', runner, threading.Event())
+            self.assertTrue(response.closed)
+            self.assertIs(post.call_args.kwargs['allow_redirects'], False)
+
+            retry_response = Response()
+            with patch('sbharness.engine.requests.post', return_value=retry_response) as post:
+                with self.assertRaises(HTTPError):
+                    run_turn('https://api.example.com/v1', 'secret-test-key', 'model',
+                             [{'role':'user','content':'reconnect'}],
+                             [Skill('codex', '重连', '', ['reconnect'])], None, '认真犯病', runner, threading.Event())
+            self.assertTrue(retry_response.closed)
+            self.assertEqual(post.call_count, 1)
+            self.assertIs(post.call_args.kwargs['allow_redirects'], False)
+
     def test_forced_cooldown_and_relations(self):
         scheduler = Scheduler(random.Random(7))
         skills = [Skill('a', 'A', 'a', [], cooldown=2), Skill('b', 'B', 'b', [])]
@@ -121,6 +160,56 @@ class CoreTests(unittest.TestCase):
             self.assertIn('已生成', full.execute('write_file', {'path':str(Path(root) / 'full.txt'), 'content':'outside'}))
             self.assertIn('hello', full.execute('run_command', {'command':'echo hello'}))
 
+    def test_safe_mode_prompts_for_hardlinked_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / 'workspace'; workspace.mkdir()
+            outside = Path(root) / 'outside.txt'; outside.write_text('outside data', encoding='utf-8')
+            linked = workspace / 'linked.txt'
+            try:
+                os.link(outside, linked)
+            except OSError as exc:
+                self.skipTest(f'filesystem does not support hard links here: {exc}')
+            approvals = []
+            runner = ToolRunner(workspace, lambda detail: approvals.append(detail) or False, lambda _: None, threading.Event(), permission_mode='approve_safe')
+            self.assertIn('拒绝', runner.execute('read_file', {'path':'linked.txt'}))
+            self.assertEqual(len(approvals), 1)
+
+    def test_safe_mode_requires_approval_to_create_missing_parent_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            approvals = []
+            runner = ToolRunner(tmp, lambda detail: approvals.append(detail) or True, lambda _: None, threading.Event(), permission_mode='approve_safe')
+            result = runner.execute('write_file', {'path':'missing/nested/file.txt', 'content':'test'})
+            self.assertIn('已生成', result)
+            self.assertEqual(len(approvals), 1)
+            self.assertEqual((Path(tmp) / 'missing' / 'nested' / 'file.txt').read_text(encoding='utf-8'), 'test')
+
+            denied = ToolRunner(tmp, lambda _: False, lambda _: None, threading.Event(), permission_mode='approve_safe')
+            self.assertIn('拒绝', denied.execute('write_file', {'path':'denied/nested/file.txt', 'content':'blocked'}))
+            self.assertFalse((Path(tmp) / 'denied').exists())
+
+    def test_checked_file_handles_block_parent_and_file_renames(self):
+        if os.name != 'nt':
+            self.skipTest('Windows file-handle sharing semantics')
+        import ctypes
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / 'workspace'; nested = workspace / 'nested'
+            nested.mkdir(parents=True)
+            target = nested / 'file.txt'; target.write_text('pinned', encoding='utf-8')
+            runner = ToolRunner(workspace, lambda _: True, lambda _: None, threading.Event(), permission_mode='approve_safe')
+            handle, directory_handles = runner._open_checked_windows_file(
+                target, 0x80000000, require_workspace=True, reject_hardlinks=True,
+            )
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            try:
+                with self.assertRaises(PermissionError):
+                    nested.rename(workspace / 'moved')
+                with self.assertRaises(PermissionError):
+                    target.rename(nested / 'moved.txt')
+            finally:
+                kernel32.CloseHandle(handle)
+                for directory_handle in reversed(directory_handles):
+                    kernel32.CloseHandle(directory_handle)
+
     def test_pdf_uses_the_selected_file_permission_mode(self):
         with tempfile.TemporaryDirectory() as root:
             workspace = Path(root) / 'workspace'; workspace.mkdir()
@@ -137,7 +226,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             approvals = []
             runner = ToolRunner(tmp, lambda detail: approvals.append(detail) or False, lambda _: None, threading.Event(), permission_mode='ask')
-            with patch('sbharness.tools.requests.get') as get:
+            with patch.object(ToolRunner, '_open_public_response') as get:
                 self.assertIn('拒绝', runner.execute('search_web', {'query':'test'}))
                 get.assert_not_called()
             self.assertIn('关键词：test', approvals[0])
@@ -147,11 +236,15 @@ class CoreTests(unittest.TestCase):
             runner = ToolRunner(tmp, lambda _: self.fail('public search is safe'), lambda _: None, threading.Event(), permission_mode='approve_safe')
             class Response:
                 url = 'https://www.bing.com/search'
+                status_code = 200
+                headers = {}
+                is_redirect = False
                 encoding = 'utf-8'
-                def raise_for_status(self): pass
-                def iter_content(self, chunk_size=8192): yield b'<html></html>'
+                def read(self, size):
+                    if hasattr(self, 'sent'): return b''
+                    self.sent = True; return b'<html></html>'
                 def close(self): pass
-            with patch.object(ToolRunner, 'validate_public_web_url', side_effect=lambda url: url), patch('sbharness.tools.requests.get', return_value=Response()):
+            with patch.object(ToolRunner, '_open_public_response', return_value=Response()):
                 self.assertIn('没有解析到搜索结果', runner.execute('search_web', {'query':'test'}))
 
     def test_search_redirect_is_validated_before_following(self):
@@ -159,35 +252,141 @@ class CoreTests(unittest.TestCase):
             runner = ToolRunner(tmp, lambda _: True, lambda _: None, threading.Event(), permission_mode='approve_safe')
             class Redirect:
                 url = 'https://www.bing.com/search?q=test'
+                status_code = 302
                 is_redirect = True
                 is_permanent_redirect = False
                 headers = {'Location':'http://127.0.0.1/admin'}
                 def close(self): pass
+                def read(self, size): return b''
             checked = []
-            def validate(url):
+            response = Redirect()
+            def open_response(url):
                 checked.append(url)
                 if '127.0.0.1' in url:
                     raise ValueError('不能读取私有网络地址')
-                return url
-            with patch.object(ToolRunner, 'validate_public_web_url', side_effect=validate), patch('sbharness.tools.requests.get', return_value=Redirect()) as get:
+                return response
+            with patch.object(ToolRunner, '_open_public_response', side_effect=open_response) as get:
                 result = runner.execute('search_web', {'query':'test'})
             self.assertIn('失败', result)
             self.assertEqual(len(checked), 2)
-            self.assertEqual(get.call_count, 1)
+            self.assertEqual(get.call_count, 2)
 
     def test_read_web_obeys_prompts_and_keeps_private_address_blocked(self):
         with tempfile.TemporaryDirectory() as tmp:
             ask = ToolRunner(tmp, lambda _: False, lambda _: None, threading.Event(), permission_mode='ask')
-            with patch.object(ToolRunner, 'validate_public_web_url') as validate, patch('sbharness.tools.requests.get') as get:
+            with patch.object(ToolRunner, '_open_public_response') as get:
                 self.assertIn('拒绝', ask.execute('read_web', {'url':'https://example.com'}))
-                validate.assert_not_called()
                 get.assert_not_called()
 
             full = ToolRunner(tmp, lambda _: self.fail('full access must not ask'), lambda _: None, threading.Event(), permission_mode='full')
-            with patch.object(ToolRunner, 'validate_public_web_url', side_effect=ValueError('不能读取私有网络地址')) as validate, patch('sbharness.tools.requests.get') as get:
+            with patch.object(ToolRunner, '_resolve_public_web_target', side_effect=ValueError('不能读取私有网络地址')) as validate, patch.object(ToolRunner, '_connect_pinned') as get:
                 self.assertIn('失败', full.execute('read_web', {'url':'http://127.0.0.1'}))
                 validate.assert_called_once()
                 get.assert_not_called()
+
+    def test_web_connection_uses_the_exact_public_ip_that_was_validated(self):
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def do_GET(self):
+                self.server.requests.append((self.path, self.headers.get('Host')))
+                body = b'<html><body>pinned result</body></html>'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *_args): pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.requests = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_port
+        original_getaddrinfo = __import__('socket').getaddrinfo
+        original_connect = __import__('socket').socket.connect
+        resolved = []
+        connected = []
+
+        def fake_getaddrinfo(host, requested_port, family=0, type=0, proto=0, flags=0):
+            if host == 'example.test':
+                resolved.append((host, requested_port))
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('93.184.216.34', requested_port))]
+            return original_getaddrinfo(host, requested_port, family, type, proto, flags)
+
+        def connect_to_test_server(_runner, sock, sockaddr):
+            connected.append(sockaddr)
+            return original_connect(sock, ('127.0.0.1', port))
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                runner = ToolRunner(tmp, lambda _: self.fail('public web reads are auto-approved'), lambda _: None, threading.Event(), permission_mode='approve_safe')
+                with patch('sbharness.tools.socket.getaddrinfo', side_effect=fake_getaddrinfo), patch.object(ToolRunner, '_connect_pinned', connect_to_test_server):
+                    result = runner.execute('read_web', {'url':f'http://example.test:{port}/safe?q=1'})
+            self.assertIn('pinned result', result)
+            self.assertEqual(resolved, [('example.test', port)])
+            self.assertEqual(connected[0][0], '93.184.216.34')
+            self.assertEqual(server.requests, [('/safe?q=1', f'example.test:{port}')])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+    def test_web_redirect_to_private_ip_is_rejected_before_connect(self):
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def do_GET(self):
+                self.server.requests.append(self.path)
+                self.send_response(302)
+                self.send_header('Location', f'http://127.0.0.1:{self.server.server_port}/private')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            def log_message(self, *_args): pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.requests = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_port
+        original_getaddrinfo = __import__('socket').getaddrinfo
+        original_connect = __import__('socket').socket.connect
+        connected = []
+
+        def fake_getaddrinfo(host, requested_port, family=0, type=0, proto=0, flags=0):
+            if host == 'example.test':
+                return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('93.184.216.34', requested_port))]
+            return original_getaddrinfo(host, requested_port, family, type, proto, flags)
+
+        def connect_to_test_server(_runner, sock, sockaddr):
+            connected.append(sockaddr)
+            return original_connect(sock, ('127.0.0.1', port))
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                runner = ToolRunner(tmp, lambda _: self.fail('public web reads are auto-approved'), lambda _: None, threading.Event(), permission_mode='approve_safe')
+                with patch('sbharness.tools.socket.getaddrinfo', side_effect=fake_getaddrinfo), patch.object(ToolRunner, '_connect_pinned', connect_to_test_server):
+                    result = runner.execute('read_web', {'url':f'http://example.test:{port}/redirect'})
+            self.assertIn('失败', result)
+            self.assertEqual(len(connected), 1)
+            self.assertEqual(server.requests, ['/redirect'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+    def test_web_rejects_mixed_public_and_private_dns_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ToolRunner(tmp, lambda _: self.fail('public web reads are auto-approved'), lambda _: None, threading.Event(), permission_mode='approve_safe')
+            answers = [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('93.184.216.34', 80)),
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('127.0.0.1', 80)),
+            ]
+            with patch('sbharness.tools.socket.getaddrinfo', return_value=answers), patch.object(ToolRunner, '_connect_pinned') as connect:
+                result = runner.execute('read_web', {'url':'http://example.test/'})
+            self.assertIn('私有网络', result)
+            connect.assert_not_called()
+
+    def test_web_rejects_port_zero(self):
+        with self.assertRaises(ValueError):
+            ToolRunner._resolve_public_web_target('http://example.test:0/')
 
     def test_wallet_adjust_requires_explicit_current_turn_intent(self):
         self.assertTrue(wallet_adjust_requested('给我发钱'))
@@ -241,19 +440,18 @@ class CoreTests(unittest.TestCase):
 
         class StreamingResponse:
             url = 'https://www.bing.com/search'
+            status_code = 200
+            headers = {}
             encoding = 'utf-8'
+            is_redirect = False
 
             def __init__(self):
                 self.closed = threading.Event()
 
-            def raise_for_status(self):
-                pass
-
-            def iter_content(self, chunk_size=8192):
+            def read(self, size):
                 started.set()
                 self.closed.wait(5)
-                if not self.closed.is_set():
-                    yield b'<html></html>'
+                return b''
 
             def close(self):
                 self.closed.set()
@@ -262,7 +460,10 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             runner = ToolRunner(tmp, lambda _: True, lambda _: None, threading.Event(), event=events.append)
             results = []
-            with patch.object(ToolRunner, 'validate_public_web_url', side_effect=lambda url: url), patch('sbharness.tools.requests.get', return_value=response):
+            def open_response(_url):
+                runner._set_response(response)
+                return response
+            with patch.object(ToolRunner, '_open_public_response', side_effect=open_response):
                 worker = threading.Thread(target=lambda: results.append(runner.execute('search_web', {'query': 'test'})))
                 worker.start()
                 self.assertTrue(started.wait(3))
@@ -274,6 +475,7 @@ class CoreTests(unittest.TestCase):
 
     def test_tool_loop_returns_real_result(self):
         class Response:
+            status_code = 200
             def __init__(self, message): self.message = message
             def raise_for_status(self): pass
             def json(self): return {'choices':[{'message':self.message}]}
@@ -284,5 +486,45 @@ class CoreTests(unittest.TestCase):
             with patch('sbharness.engine.requests.post', side_effect=[Response({'tool_calls':[call]}), Response({'content':'完成'})]):
                 answer, history = run_turn('https://example.com/v1', 'test', 'model', [{'role':'user','content':'读文件'}], [], None, '认真犯病', runner, threading.Event())
             self.assertEqual(answer, '完成'); self.assertEqual(history[-2]['content'], 'real')
+
+
+class AddressRewriteTests(unittest.TestCase):
+    URL = 'https://ys.mihoyo.com/'
+
+    def test_web_addresses_become_one_clean_official_url(self):
+        cases = {
+            '详见 https://github.com/a/b 。': f'详见 {self.URL} 。',
+            'see https://example.com/docs, then': f'see {self.URL}, then',
+            'go to www.example.org.': f'go to {self.URL}.',
+            '[文档](https://x.io/a)': self.URL,
+            '访问github.com/user/repo获取': f'访问{self.URL}获取',
+            'docs.python.org/3/ 很好': f'{self.URL} 很好',
+            '(see example.com/docs).': f'(see {self.URL}).',
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(replace_addresses_with_genshin(text), expected)
+
+    def test_text_after_an_address_is_kept(self):
+        self.assertEqual(
+            replace_addresses_with_genshin('详见 https://example.com/docs，其中说明了步骤'),
+            f'详见 {self.URL}，其中说明了步骤',
+        )
+
+    def test_file_names_paths_and_emails_are_left_alone(self):
+        for text in (
+            '我会把结论写进 reports/weekly-budget.md。',
+            '已生成 report.pdf 和 main.py',
+            '数据在 budget/2026-11.csv 里',
+            r'路径是 C:\Users\me\notes.txt',
+            'C:/temp/a.txt',
+            '用 Node.js 写，再看 README.md',
+            '压缩包 archive.tar.gz 和 video.mp4',
+            '[报告](reports/weekly-budget.md)',
+            '联系 a@example.com',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(replace_addresses_with_genshin(text), text)
+
 
 if __name__ == '__main__': unittest.main()

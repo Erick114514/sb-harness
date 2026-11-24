@@ -1,21 +1,26 @@
 import json
 import base64
+import ctypes
+import http.client
+import io
 import os
 import subprocess
 import threading
 import shutil
 import re
 import ipaddress
-import re
 import socket
+import ssl
+import zlib
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - desktop target is Windows
+    msvcrt = None
 from decimal import Decimal
 import uuid
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urljoin
-
-import requests
-
+from urllib.parse import urlparse, parse_qs, urljoin, urlencode, urlunparse, quote
 
 def schema(name, description, properties, required):
     return {'type': 'function', 'function': {'name': name, 'description': description, 'parameters': {'type': 'object', 'properties': properties, 'required': required}}}
@@ -119,6 +124,49 @@ class _ReadFileContent(str):
     """Marks file bytes as successful data so body text cannot forge log status."""
 
 
+class _PinnedResponse:
+    """Small HTTP response wrapper which owns a socket pinned to a checked IP."""
+
+    def __init__(self, connection, response, url):
+        self.connection = connection
+        self.response = response
+        self.url = url
+        self.status_code = response.status
+        self.headers = response.headers
+        self.encoding = None
+        try:
+            from email.message import Message
+            content_type = Message()
+            content_type['content-type'] = self.headers.get('Content-Type', '')
+            self.encoding = content_type.get_content_charset()
+        except (TypeError, ValueError):
+            pass
+        self.closed = False
+
+    @property
+    def is_redirect(self):
+        return self.status_code in (301, 302, 303, 307, 308)
+
+    @property
+    def is_permanent_redirect(self):
+        return self.status_code in (301, 308)
+
+    def read(self, size):
+        if self.closed:
+            return b''
+        reader = getattr(self.response, 'read1', self.response.read)
+        return reader(size)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.response.close()
+        finally:
+            self.connection.close()
+
+
 class ToolRunner:
     PERMISSION_MODES = {'ask', 'approve_safe', 'full'}
 
@@ -160,11 +208,17 @@ class ToolRunner:
                 return False
             candidates = [lexical, lexical.parent, *lexical.parent.parents]
             for candidate in candidates:
-                if candidate.exists():
+                try:
+                    info = candidate.lstat()
+                except FileNotFoundError:
+                    info = None
+                if info is not None:
                     if candidate.is_symlink() or (hasattr(os.path, 'isjunction') and os.path.isjunction(candidate)):
                         return False
-                    attributes = getattr(candidate.stat(follow_symlinks=False), 'st_file_attributes', 0)
-                    if attributes & getattr(__import__('stat'), 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400):
+                    attributes = getattr(info, 'st_file_attributes', 0)
+                    if attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                        return False
+                    if candidate == lexical and not (attributes & 0x10) and getattr(info, 'st_nlink', 1) > 1:
                         return False
                 if candidate == self.workspace:
                     return path.is_relative_to(self.workspace)
@@ -172,14 +226,18 @@ class ToolRunner:
             return False
         return False
 
-    def _needs_approval(self, *, path=None, raw_path=None, public_web=False):
+    def _needs_approval(self, *, path=None, raw_path=None, public_web=False, existing_parent=False):
         if self.permission_mode == 'full':
             return False
         if self.permission_mode == 'ask':
             return True
         if public_web:
             return False
-        return not (path is not None and self._safe_auto_path(path, raw_path))
+        return not (
+            path is not None
+            and self._safe_auto_path(path, raw_path)
+            and (not existing_parent or path.parent.is_dir())
+        )
 
     def _safe_args(self, name, args):
         safe = {key: redact(value) for key, value in args.items()}
@@ -207,7 +265,7 @@ class ToolRunner:
         return path
 
     @staticmethod
-    def validate_public_web_url(url):
+    def _resolve_public_web_target(url):
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError('只支持不带凭据的公开 HTTP(S) 网页')
@@ -215,12 +273,272 @@ class ToolRunner:
         if host == 'localhost' or host.endswith('.localhost') or host.endswith('.local'):
             raise ValueError('不能读取本机或局域网地址')
         try:
-            addresses = {ipaddress.ip_address(result[4][0].split('%', 1)[0]) for result in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == 'https' else 80), type=socket.SOCK_STREAM)}
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == 'https' else 80)
+            if not 1 <= port <= 65535:
+                raise ValueError('网页端口无效')
+            lookup_host = host.encode('idna').decode('ascii')
+            results = socket.getaddrinfo(lookup_host, port, type=socket.SOCK_STREAM)
         except (OSError, ValueError) as exc:
             raise ValueError('无法验证网页是否位于公开网络') from exc
-        if not addresses or not all(address.is_global for address in addresses):
+        targets = []
+        for family, socktype, proto, _canonname, sockaddr in results:
+            try:
+                address = ipaddress.ip_address(sockaddr[0].split('%', 1)[0])
+            except ValueError:
+                raise ValueError('无法验证网页是否位于公开网络')
+            if not address.is_global:
+                raise ValueError('不能读取本机、私有网络或保留地址')
+            target = (family, socktype, proto, sockaddr)
+            if target not in targets:
+                targets.append(target)
+        if not targets:
             raise ValueError('不能读取本机、私有网络或保留地址')
+        return parsed, lookup_host, port, targets
+
+    @classmethod
+    def validate_public_web_url(cls, url):
+        cls._resolve_public_web_target(url)
         return url
+
+    def _connect_pinned(self, sock, sockaddr):
+        """Connect to the exact address returned by the public-address check."""
+        sock.connect(sockaddr)
+
+    def _open_public_response(self, url):
+        """Open HTTP(S) without a proxy or a second DNS lookup after validation."""
+        parsed, host, port, targets = self._resolve_public_web_target(url)
+        path = quote(parsed.path or '/', safe="/%:@!$&'()*+,;=-._~")
+        if parsed.query:
+            path += '?' + quote(parsed.query, safe="/%?:@!$&'()*+,;=-._~")
+        host_header = f'[{host}]' if ':' in host else host
+        if port != (443 if parsed.scheme == 'https' else 80):
+            host_header += f':{port}'
+        last_error = None
+        for family, socktype, proto, sockaddr in targets:
+            if self.cancel.is_set():
+                return None
+            if parsed.scheme == 'https':
+                connection = http.client.HTTPSConnection(host, port, timeout=5, context=ssl.create_default_context())
+            else:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+            raw_sock = socket.socket(family, socktype, proto)
+            raw_sock.settimeout(5)
+            connection.sock = raw_sock
+            self._set_response(connection)
+            try:
+                self._connect_pinned(raw_sock, sockaddr)
+                if self.cancel.is_set():
+                    connection.close()
+                    self._set_response(None)
+                    return None
+                if parsed.scheme == 'https':
+                    connection.sock = connection._context.wrap_socket(raw_sock, server_hostname=host)
+                    connection.sock.settimeout(5)
+                connection.putrequest('GET', path, skip_host=True, skip_accept_encoding=True)
+                connection.putheader('Host', host_header)
+                connection.putheader('User-Agent', 'Mozilla/5.0')
+                connection.putheader('Accept', 'text/html,application/xhtml+xml,*/*;q=0.8')
+                connection.putheader('Accept-Encoding', 'identity')
+                connection.putheader('Connection', 'close')
+                connection.endheaders()
+                response = connection.getresponse()
+                pinned_response = _PinnedResponse(connection, response, url)
+                self._set_response(pinned_response)
+                return pinned_response
+            except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+                last_error = exc
+                connection.close()
+                self._set_response(None)
+                if self.cancel.is_set():
+                    return None
+            except Exception:
+                connection.close()
+                self._set_response(None)
+                raise
+        if self.cancel.is_set():
+            return None
+        raise OSError(f'无法连接到已验证的公网地址：{last_error}') from last_error
+
+    @staticmethod
+    def _normal_windows_path(path):
+        value = str(path).replace('/', '\\')
+        if value.startswith('\\\\?\\UNC\\'):
+            value = '\\\\' + value[8:]
+        elif value.startswith('\\\\?\\'):
+            value = value[4:]
+        return os.path.normcase(os.path.abspath(value))
+
+    def _open_checked_windows_file(self, path, access, *, create=False, require_workspace=False,
+                                   reject_hardlinks=False, reject_reparse=False):
+        """Open once, then validate and use that same Windows file handle."""
+        if os.name != 'nt' or msvcrt is None:
+            raise RuntimeError('当前平台无法进行可靠的文件句柄边界检查；请切换到逐次询问模式')
+        import ctypes.wintypes as wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                         wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, wintypes.LPVOID]
+        kernel32.CreateDirectoryW.restype = wintypes.BOOL
+        kernel32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR,
+                                                        wintypes.DWORD, wintypes.DWORD]
+        kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        kernel32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                           wintypes.LPVOID, wintypes.DWORD]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                         wintypes.LPVOID, wintypes.DWORD]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+
+        path = Path(path)
+        expected = self._normal_windows_path(path.resolve(strict=False))
+        existed_before = path.exists()
+        disposition = 3  # OPEN_EXISTING
+        if create and not existed_before:
+            disposition = 1  # CREATE_NEW: never truncate a raced-in file
+        flags = 0x80 | (0x00200000 if reject_reparse else 0)  # FILE_ATTRIBUTE_NORMAL | optional OPEN_REPARSE_POINT
+        invalid_handle = wintypes.HANDLE(-1).value
+        directory_handles = []
+        handle = None
+        created = bool(create and not existed_before)
+
+        def final_path_for(open_handle):
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = kernel32.GetFinalPathNameByHandleW(open_handle, buffer, len(buffer), 0)
+            if not length or length >= len(buffer):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return self._normal_windows_path(buffer.value)
+
+        def file_info(open_handle, info_class, structure):
+            value = structure()
+            if not kernel32.GetFileInformationByHandleEx(open_handle, info_class, ctypes.byref(value), ctypes.sizeof(value)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return value
+
+        try:
+            class FileAttributeTagInfo(ctypes.Structure):
+                _fields_ = [('FileAttributes', wintypes.DWORD), ('ReparseTag', wintypes.DWORD)]
+
+            parent = path.parent
+            directories = [Path(parent.anchor)]
+            current = Path(parent.anchor)
+            for part in parent.parts[1:]:
+                current = current / part
+                directories.append(current)
+            for directory in directories:
+                directory_handle = kernel32.CreateFileW(
+                    str(directory), 0x80, 0x3, None, 3,
+                    0x02000000 | (0x00200000 if reject_reparse else 0), None,
+                )
+                if directory_handle == invalid_handle:
+                    open_error = ctypes.get_last_error()
+                    if not create or open_error not in (2, 3):  # FILE/PATH_NOT_FOUND
+                        raise ctypes.WinError(open_error)
+                    if not kernel32.CreateDirectoryW(str(directory), None):
+                        create_error = ctypes.get_last_error()
+                        if create_error != 183:  # ERROR_ALREADY_EXISTS: inspect it below
+                            raise ctypes.WinError(create_error)
+                    directory_handle = kernel32.CreateFileW(
+                        str(directory), 0x80, 0x3, None, 3,
+                        0x02000000 | (0x00200000 if reject_reparse else 0), None,
+                    )
+                    if directory_handle == invalid_handle:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                directory_handles.append(directory_handle)
+                expected_directory = self._normal_windows_path(directory)
+                if final_path_for(directory_handle) != expected_directory:
+                    raise PermissionError('父目录在打开过程中发生变化，已停止操作')
+                directory_info = file_info(directory_handle, 9, FileAttributeTagInfo)
+                if (reject_reparse and directory_info.FileAttributes & 0x400) or not directory_info.FileAttributes & 0x10:
+                    raise PermissionError('父目录包含重解析点或不是普通目录，已停止操作')
+
+            if create and not existed_before:
+                access |= 0x00010000  # DELETE, so a raced-outside CREATE_NEW can be removed by handle
+            handle = kernel32.CreateFileW(str(path), access, 0x3, None, disposition, flags, None)
+            if handle == invalid_handle:
+                handle = None
+                raise ctypes.WinError(ctypes.get_last_error())
+            actual = final_path_for(handle)
+            if actual != expected:
+                raise PermissionError('文件路径在打开过程中发生变化，已停止操作')
+            attribute_info = file_info(handle, 9, FileAttributeTagInfo)
+            if reject_reparse and attribute_info.FileAttributes & 0x400:
+                raise PermissionError('拒绝通过重解析点自动访问文件')
+            if attribute_info.FileAttributes & 0x10:
+                raise IsADirectoryError('目标是文件夹，不是普通文件')
+
+            class FileStandardInfo(ctypes.Structure):
+                _fields_ = [('AllocationSize', ctypes.c_longlong), ('EndOfFile', ctypes.c_longlong),
+                            ('NumberOfLinks', wintypes.DWORD), ('DeletePending', wintypes.BOOLEAN),
+                            ('Directory', wintypes.BOOLEAN)]
+
+            standard_info = file_info(handle, 1, FileStandardInfo)
+            if reject_hardlinks and standard_info.NumberOfLinks > 1:
+                raise PermissionError('拒绝自动访问存在多个硬链接的文件')
+            if require_workspace:
+                root = self._normal_windows_path(self.workspace)
+                try:
+                    if os.path.commonpath((actual, root)) != root:
+                        raise PermissionError('文件句柄指向了工作目录以外的位置，已停止操作')
+                except ValueError as exc:
+                    raise PermissionError('文件句柄不在授权工作目录内') from exc
+            return handle, directory_handles
+        except Exception:
+            if created and handle is not None:
+                class FileDispositionInfo(ctypes.Structure):
+                    _fields_ = [('DeleteFile', ctypes.c_ubyte)]
+                disposition_info = FileDispositionInfo(1)
+                kernel32.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition_info), ctypes.sizeof(disposition_info))
+            if handle is not None:
+                kernel32.CloseHandle(handle)
+            for directory_handle in reversed(directory_handles):
+                kernel32.CloseHandle(directory_handle)
+            raise
+
+    def _read_checked_file(self, path, *, require_workspace, reject_hardlinks=False):
+        handle, directory_handles = self._open_checked_windows_file(
+            path, 0x80000000, require_workspace=require_workspace, reject_hardlinks=reject_hardlinks,
+            reject_reparse=reject_hardlinks,
+        )
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            handle = None
+            with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+                return stream.read(30000)
+        finally:
+            if handle is not None:
+                ctypes.WinDLL('kernel32', use_last_error=True).CloseHandle(handle)
+            for directory_handle in reversed(directory_handles):
+                ctypes.WinDLL('kernel32', use_last_error=True).CloseHandle(directory_handle)
+
+    def _write_checked_file(self, path, data, *, require_workspace, reject_hardlinks=False):
+        import ctypes.wintypes as wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong,
+                                               ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+        kernel32.SetFilePointerEx.restype = wintypes.BOOL
+        kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+        kernel32.SetEndOfFile.restype = wintypes.BOOL
+        handle, directory_handles = self._open_checked_windows_file(
+            path, 0x40000000, create=True, require_workspace=require_workspace, reject_hardlinks=reject_hardlinks,
+            reject_reparse=reject_hardlinks,
+        )
+        try:
+            if not kernel32.SetFilePointerEx(handle, 0, None, 0) or not kernel32.SetEndOfFile(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+            handle = None
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+        finally:
+            if handle is not None:
+                kernel32.CloseHandle(handle)
+            for directory_handle in reversed(directory_handles):
+                kernel32.CloseHandle(directory_handle)
 
     def execute(self, name, args):
         if self.cancel.is_set():
@@ -262,24 +580,21 @@ class ToolRunner:
                 pass
 
     def _get_text(self, url, *, params=None, allow_redirects=True, max_bytes=1_000_000):
-        """Fetch bounded public content with cancellable, individually checked redirects."""
+        """Fetch bounded public content, pinning every checked DNS result to its socket."""
         current_url, current_params = url, params
         for _ in range(6):
             if self.cancel.is_set():
                 return current_url, ''
-            self.validate_public_web_url(current_url)
-            response = requests.get(
-                current_url,
-                params=current_params,
-                headers={'User-Agent': 'Mozilla/5.0'},
-                timeout=(5, 3),
-                allow_redirects=False,
-                stream=True,
-            )
-            self._set_response(response)
+            if current_params:
+                parsed = urlparse(current_url)
+                query = '&'.join(value for value in (parsed.query, urlencode(current_params, doseq=True)) if value)
+                current_url = urlunparse(parsed._replace(query=query))
+            response = self._open_public_response(current_url)
+            if response is None:
+                return current_url, ''
             try:
-                if getattr(response, 'is_redirect', False) or getattr(response, 'is_permanent_redirect', False):
-                    target = getattr(response, 'headers', {}).get('Location')
+                if response.is_redirect:
+                    target = response.headers.get('Location')
                     if not target:
                         raise ValueError('网页重定向缺少目标地址')
                     if not allow_redirects:
@@ -287,23 +602,28 @@ class ToolRunner:
                     current_url = urljoin(response.url or current_url, target)
                     current_params = None
                     continue
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    raise ValueError(f'网页请求失败：HTTP {response.status_code}')
                 chunks, size = [], 0
-                for chunk in response.iter_content(chunk_size=8192):
+                while size < max_bytes:
                     if self.cancel.is_set():
                         return response.url, ''
+                    chunk = response.read(min(8192, max_bytes - size))
                     if not chunk:
-                        continue
-                    remaining = max_bytes - size
-                    if remaining <= 0:
                         break
-                    chunk = chunk[:remaining]
                     chunks.append(chunk)
                     size += len(chunk)
-                    if size >= max_bytes:
-                        break
-                encoding = response.encoding or 'utf-8'
-                return response.url, b''.join(chunks).decode(encoding, errors='replace')
+                body = b''.join(chunks)
+                content_encoding = response.headers.get('Content-Encoding', 'identity').lower().strip()
+                if content_encoding in ('gzip', 'x-gzip'):
+                    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    body = decoder.decompress(body, max_bytes)
+                elif content_encoding == 'deflate':
+                    decoder = zlib.decompressobj()
+                    body = decoder.decompress(body, max_bytes)
+                elif content_encoding not in ('', 'identity'):
+                    raise ValueError(f'网页使用不支持的压缩格式：{content_encoding}')
+                return response.url, body[:max_bytes].decode(response.encoding or 'utf-8', errors='replace')
             finally:
                 self._set_response(None)
                 response.close()
@@ -330,28 +650,41 @@ class ToolRunner:
         if name == 'read_file':
             raw_path = args['path']
             path = self.path(raw_path)
+            approved_path = path
             if self._needs_approval(path=path, raw_path=raw_path):
                 if not self._confirm(f'读取文件\n目标：{path}'):
                     return self._approval_denied_result()
             if self.cancel.is_set():
                 return '已取消'
             path = self.path(raw_path)
-            return _ReadFileContent(path.read_text(encoding='utf-8')[:30000])
+            if path != approved_path:
+                raise PermissionError('路径在确认后发生变化，已停止操作')
+            if os.name == 'nt':
+                content = self._read_checked_file(
+                    path,
+                    require_workspace=self.permission_mode == 'approve_safe' and path.is_relative_to(self.workspace),
+                    reject_hardlinks=self.permission_mode == 'approve_safe',
+                )
+            else:
+                content = path.read_text(encoding='utf-8')
+            return _ReadFileContent(content[:30000])
         if name in ('write_file', 'make_pdf'):
             raw_path = args['path']
             path = self.path(raw_path)
+            approved_path = path
             preview = args['content'][:4000]
             if len(args['content']) > 4000: preview += '\n……（仅显示前 4000 字符）'
-            if self._needs_approval(path=path, raw_path=raw_path):
+            if self._needs_approval(path=path, raw_path=raw_path, existing_parent=True):
                 if not self._confirm(f'{name}\n目标：{path}\n内容：\n{preview}'):
                     return self._approval_denied_result()
             if self.cancel.is_set():
                 return '已取消'
-            # Resolve again after approval, so a changed symlink cannot silently escape.
+            # Resolve again after approval. Safe mode additionally validates the final handle.
             path = self.path(raw_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if path != approved_path:
+                raise PermissionError('路径在确认后发生变化，已停止操作')
             if name == 'write_file':
-                path.write_text(args['content'], encoding='utf-8')
+                data = args['content'].encode('utf-8')
             else:
                 from reportlab.pdfgen import canvas
                 from reportlab.pdfbase import pdfmetrics
@@ -360,7 +693,8 @@ class ToolRunner:
                 if not font.exists():
                     raise RuntimeError('找不到 Windows 中文字体 Microsoft YaHei')
                 pdfmetrics.registerFont(TTFont('SBChinese', str(font)))
-                pdf = canvas.Canvas(str(path))
+                pdf_buffer = io.BytesIO()
+                pdf = canvas.Canvas(pdf_buffer)
                 pdf.setFont('SBChinese', 11)
                 y = 800
                 for paragraph in args['content'].splitlines() or ['']:
@@ -369,6 +703,21 @@ class ToolRunner:
                             pdf.showPage(); pdf.setFont('SBChinese', 11); y = 800
                         pdf.drawString(40, y, paragraph[start:start + 45]); y -= 18
                 pdf.save()
+                data = pdf_buffer.getvalue()
+            if os.name == 'nt':
+                if self.permission_mode != 'approve_safe' and not path.parent.is_dir():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if self.path(raw_path) != approved_path:
+                        raise PermissionError('目录在创建过程中发生变化，已停止操作')
+                self._write_checked_file(
+                    path,
+                    data,
+                    require_workspace=self.permission_mode == 'approve_safe' and path.is_relative_to(self.workspace),
+                    reject_hardlinks=self.permission_mode == 'approve_safe',
+                )
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
             return f'已生成：{path}'
         if name == 'search_web':
             if self._needs_approval(public_web=True):
@@ -386,39 +735,12 @@ class ToolRunner:
             if self._needs_approval(public_web=True):
                 if not self._confirm(f'读取网页\n地址：{url}'):
                     return self._approval_denied_result()
-            self.validate_public_web_url(url)
-            for _ in range(6):
-                if self.cancel.is_set():
-                    return '已取消'
-                self.validate_public_web_url(url)
-                response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(5, 3), allow_redirects=False, stream=True)
-                self._set_response(response)
-                try:
-                    if response.is_redirect or response.is_permanent_redirect:
-                        target = response.headers.get('Location')
-                    else:
-                        response.raise_for_status()
-                        parser = TextExtractor()
-                        content = bytearray()
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if self.cancel.is_set():
-                                return '已取消'
-                            if chunk:
-                                content.extend(chunk[:max(0, 1_000_000 - len(content))])
-                            if len(content) >= 1_000_000:
-                                break
-                        encoding = response.encoding or 'utf-8'
-                        parser.feed(bytes(content).decode(encoding, errors='replace'))
-                        return f'来源：{response.url}\n' + ' '.join(parser.parts)[:20000]
-                finally:
-                    self._set_response(None)
-                    response.close()
-                if response.is_redirect or response.is_permanent_redirect:
-                    if not target:
-                        raise ValueError('网页重定向缺少目标地址')
-                    url = urljoin(url, target)
-                    continue
-            raise ValueError('网页重定向次数过多')
+            final_url, content = self._get_text(url, max_bytes=1_000_000)
+            if self.cancel.is_set():
+                return '已取消'
+            parser = TextExtractor()
+            parser.feed(content)
+            return f'来源：{final_url}\n' + ' '.join(parser.parts)[:20000]
         if name == 'run_command':
             command = args['command']
             if self.permission_mode != 'full' and not self._confirm(f'运行命令（可能访问工作目录外资源）：\n{command}\n工作目录：{self.workspace}'):

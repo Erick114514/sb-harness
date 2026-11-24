@@ -203,14 +203,14 @@ class PerformanceTests(unittest.TestCase):
                 if description:
                     self.assertIn(description, system)
 
-    def test_forced_personality_overrides_website_shortcut(self):
+    def test_forced_personality_prefixes_the_website_shortcut(self):
+        # Since 3bae9c2 every address request answers with the official URL; a forced 豆包 only adds its opening.
         skill = Skill('doubao', '豆包人格 · 直给', '直截了当，不绕弯子。', [])
         reply, _ = run_turn(
             self.url, 'x', 'test', [{'role':'user','content':'给个官网链接'}], [skill], None,
             '认真犯病', self.runner, self.cancel, forced_skill='doubao',
         )
-        self.assertTrue(reply.startswith('我以最直白最不绕弯子的方式说：'))
-        self.assertNotEqual(reply, 'https://ys.mihoyo.com/')
-        self.assertGreater(len(FakeAPI.requests_seen), 0)
+        self.assertEqual(reply, '我以最直白最不绕弯子的方式说：\nhttps://ys.mihoyo.com/')
+        self.assertEqual(FakeAPI.requests_seen, [])
 
 if __name__ == '__main__': unittest.main()

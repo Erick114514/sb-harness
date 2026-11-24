@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtCore import QEvent, Qt, QSettings
+from PySide6.QtCore import QEvent, QPoint, Qt, QSettings
 from PySide6.QtGui import QInputMethodEvent, QKeyEvent
 from PySide6.QtWidgets import QApplication
 import sbharness.__main__ as desktop
@@ -293,5 +293,182 @@ class DesktopTests(unittest.TestCase):
             self.assertEqual(len(story), 2)
             self.assertIn('申诉窗口', story[0]['summary'])
             self.assertIn('复核已结束', story[1]['summary'])
+
+
+class WindowTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def open_window(self):
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        settings = QSettings(str(Path(temp) / 'settings.ini'), QSettings.IniFormat)
+        self.enterContext(patch.object(desktop, 'DATA', Path(temp) / 'data'))
+        self.enterContext(patch.object(desktop, 'SKILLS', Path(temp) / 'skills'))
+        self.enterContext(patch.object(desktop, 'QSettings', return_value=settings))
+        window = desktop.Window()
+        self.addCleanup(window.close)
+        return window
+
+    def settle(self, rounds=4):
+        for _ in range(rounds):
+            self.app.processEvents()
+
+
+class LayoutFixTests(WindowTestCase):
+    def test_sidebar_labels_show_the_sidebar_colour(self):
+        window = self.open_window()
+        window.show()
+        self.settle()
+        label = window.sidebar.findChild(desktop.QLabel, 'brand')
+        point = label.mapTo(window.sidebar, QPoint(1, 1))
+        pixmap = window.sidebar.grab()
+        ratio = pixmap.devicePixelRatio()
+        colour = pixmap.toImage().pixelColor(int(point.x() * ratio), int(point.y() * ratio))
+        self.assertEqual(colour.name().upper(), window.theme.sidebar.upper())
+
+    def test_api_profile_selector_is_filled_on_start(self):
+        window = self.open_window()
+        self.assertEqual(window.profile_box.count(), len(window.api_profiles))
+        self.assertEqual(window.profile_box.currentData(), window.active_profile_id)
+        self.assertEqual(window.profile_box.currentText(), window.api_profiles[0]['label'])
+
+    def test_chat_follows_window_width_without_clipping(self):
+        window = self.open_window()
+        window.resize(1180, 760)
+        window.show()
+        self.settle()
+        window.add_message('user', '帮我把这周的预算整理成一份报告，存到工作目录里')
+        window.add_message('assistant', '冰箱审批部门放行了两项。' * 20)
+        window._tool_event({
+            'call_id': 'long', 'name': 'run_command',
+            'args': {'command': 'Get-ChildItem ' + 'x' * 60}, 'status': 'running',
+        })
+        long_title = '一个很长的对话标题' * 8
+        window.conversation_title.setText(long_title)
+        self.settle()
+        window.resize(680, 560)
+        self.settle(6)
+        viewport = window.chat.viewport().width()
+        self.assertLessEqual(window.chat.widget().width(), viewport)
+        for entry in window.chat.entries:
+            right = entry.mapTo(window.chat.viewport(), QPoint(entry.width(), 0)).x()
+            self.assertLessEqual(right, viewport)
+        self.assertLess(window.conversation_title.geometry().right(), window.story_button.geometry().left())
+        self.assertEqual(window.conversation_title.text(), long_title)
+        self.assertIn(window.chat.cards['long'].title_text(), window.chat.toPlainText())
+
+    def test_sidebar_list_elides_and_project_switch_shows_the_project(self):
+        window = self.open_window()
+        window.resize(1180, 760)
+        window.show()
+        self.settle()
+        window.add_message('user', '把一份很长很长的会议纪要改写成冰箱法庭的判决书然后再改回来')
+        self.settle()
+        history = window.history_list
+        self.assertEqual(history.horizontalScrollBarPolicy(), Qt.ScrollBarAlwaysOff)
+        self.assertLessEqual(history.visualItemRect(history.item(0)).right(), history.viewport().width())
+        self.assertEqual(window.project_name_label.text(), window.state['projects'][0]['name'])
+        for button in (window.skill_button, window.settings_button):
+            self.assertEqual(button.text(), '')
+            self.assertFalse(button.icon().isNull())
+
+
+class StyleTests(WindowTestCase):
+    def test_every_style_redraws_the_same_conversation(self):
+        window = self.open_window()
+        window.resize(1180, 760)
+        window.show()
+        window.add_message('user', '帮我整理预算')
+        window._tool_event({'call_id': 'r1', 'name': 'read_file', 'args': {'path': 'budget.csv'}, 'status': 'done'})
+        window.add_message('assistant', '**报告已经起草。**')
+        self.settle()
+        expected = window.chat.toPlainText()
+        for theme_id, theme in desktop.THEMES.items():
+            with self.subTest(style=theme_id):
+                window.apply_theme(theme_id)
+                self.settle()
+                self.assertEqual(window.theme.id, theme_id)
+                self.assertEqual(window.sidebar.isVisible(), theme.nav == 'sidebar')
+                self.assertEqual(window.rail.isVisible(), theme.nav == 'rail')
+                self.assertEqual(window.switch_button.isVisible(), theme.nav == 'none')
+                self.assertEqual(window.chat.toPlainText(), expected)
+                self.assertEqual(window.chat.cards['r1'].kind, theme.tool_style)
+                self.assertTrue(window.style_cards[theme_id].isChecked())
+                self.assertIn(theme.accent.lower(), window.styleSheet().lower())
+
+    def test_style_choice_persists_and_settings_cards_switch_it(self):
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        settings = QSettings(str(Path(temp) / 'settings.ini'), QSettings.IniFormat)
+        self.enterContext(patch.object(desktop, 'DATA', Path(temp) / 'data'))
+        self.enterContext(patch.object(desktop, 'SKILLS', Path(temp) / 'skills'))
+        self.enterContext(patch.object(desktop, 'QSettings', return_value=settings))
+        first = desktop.Window()
+        self.assertEqual(first.theme.id, desktop.DEFAULT_THEME)
+        first.style_cards['console'].click()
+        self.assertEqual(first.theme.id, 'console')
+        self.assertEqual(settings.value('theme'), 'console')
+        first.close()
+        second = desktop.Window()
+        self.addCleanup(second.close)
+        self.assertEqual(second.theme.id, 'console')
+        self.assertFalse(second.sidebar.isVisibleTo(second))
+        self.assertTrue(second.style_cards['console'].isChecked())
+
+    def test_inline_approval_allows_and_keeps_the_decision(self):
+        window = self.open_window()
+        window.apply_theme('docket')
+
+        class WorkerStub:
+            def __init__(self):
+                self.approved = None
+                self.answer_event = threading.Event()
+                self.cancel = threading.Event()
+
+            def stop(self):
+                self.cancel.set()
+                self.answer_event.set()
+
+        worker = WorkerStub()
+        window.worker = worker
+        self.addCleanup(setattr, window, 'worker', None)
+        window._tool_event({'call_id': 'w1', 'name': 'write_file', 'args': {'path': 'report.md'}, 'status': 'waiting'})
+        window.request_approval('写入文件\n目标：report.md\n内容：\n第一行')
+        row = window.chat.cards['w1']
+        self.assertIs(window.approval_dialog, row)
+        self.assertTrue(row.approval.isVisibleTo(row))
+        self.assertIn('目标：report.md', row.approval.detail.toPlainText())
+        row.approval.allow_button.click()
+        self.assertTrue(worker.approved)
+        self.assertTrue(worker.answer_event.is_set())
+        self.assertIsNone(window.approval_dialog)
+        stored = next(item['event'] for item in window.current_conversation['timeline'] if item.get('kind') == 'tool')
+        self.assertEqual(stored['approval'], 'approved')
+        window.apply_theme('yolk')
+        self.assertEqual(window.chat.cards['w1'].tool_event['approval'], 'approved')
+
+    def test_send_button_turns_into_stop_while_running(self):
+        window = self.open_window()
+        for theme_id in ('yolk', 'console'):
+            with self.subTest(style=theme_id):
+                window.apply_theme(theme_id)
+                window._set_running(True)
+                self.assertEqual(window.action_button.property('state'), 'stop')
+                self.assertEqual(window.action_button.accessibleName(), '停止')
+                window._set_running(False)
+                self.assertEqual(window.action_button.property('state'), 'send')
+                self.assertEqual(window.action_button.accessibleName(), '发送')
+        self.assertEqual(window.action_button.text(), 'Enter 发送')
+
+    def test_behaviour_chip_and_settings_stay_in_sync(self):
+        window = self.open_window()
+        window._set_intensity(1)
+        window._set_mode('纯种 SB')
+        self.assertEqual(window.intensity.currentIndex(), 1)
+        self.assertEqual(window.mode.currentText(), '纯种 SB')
+        self.assertEqual(window.behavior_button.text(), '纯种 SB')
+        self.assertEqual(window.settings.value('mode'), '纯种 SB')
+        self.assertEqual(int(window.settings.value('intensity')), 1)
+
 
 if __name__ == '__main__': unittest.main()

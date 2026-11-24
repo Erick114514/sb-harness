@@ -1,6 +1,8 @@
 import json
+import ipaddress
 import re
 import requests
+from urllib.parse import urlparse
 from .tools import TOOL_SCHEMAS
 from .skills import BUILTINS
 
@@ -11,8 +13,28 @@ MAX_STORY_LENGTH = 1200
 GENSHIN_OFFICIAL_URL = 'https://ys.mihoyo.com/'
 _ADDRESS_TRAILING_PUNCTUATION = '.,;:!?)]}，。；：！？、'
 _MARKDOWN_LINK_RE = re.compile(r'(?<!!)\[([^\]\n]+)\]\(([^)\n]+)\)')
-_URL_RE = re.compile(r'(?i)(?<![\w@])(?:https?://|ftp://|www\.)[^\s<>`]+')
-_DOMAIN_RE = re.compile(r'(?i)(?<![\w@])(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d{1,5})?(?:/[^\s<>`]+)?')
+# ASCII URL characters only: an address stops at CJK text, so the prose after a link is kept.
+_URL_CHARS = r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]"
+# Extensions that would otherwise read as top-level domains (README.md, main.py, Node.js).
+_FILE_EXTENSIONS = (
+    'md', 'markdown', 'txt', 'log', 'csv', 'tsv', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'ini', 'cfg',
+    'conf', 'env', 'lock', 'spec', 'iss', 'dpapi', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'xlsm', 'ppt',
+    'pptx', 'odt', 'ods', 'odp', 'rtf', 'epub', 'html', 'htm', 'xml', 'svg', 'css', 'scss', 'sass', 'less',
+    'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'vue', 'svelte', 'py', 'pyw', 'pyi', 'ipynb', 'rb', 'php',
+    'java', 'kt', 'kts', 'go', 'rs', 'cs', 'cpp', 'cc', 'cxx', 'hpp', 'hh', 'swift', 'dart', 'scala', 'lua',
+    'sql', 'db', 'sqlite', 'sh', 'bash', 'zsh', 'bat', 'cmd', 'exe', 'msi', 'dll', 'jar', 'png', 'jpg',
+    'jpeg', 'gif', 'webp', 'ico', 'bmp', 'tif', 'tiff', 'heic', 'wav', 'flac', 'ogg', 'mov', 'avi', 'mkv',
+    'webm', 'zip', 'rar', 'tar', 'gz', 'tgz', 'xz', 'bz', 'iso', 'dmg', 'apk', 'bin', 'dat', 'bak', 'tmp',
+    'patch', 'diff', 'pem', 'crt', 'key', 'pub', 'ttf', 'otf', 'woff', 'srt', 'vtt',
+)
+_URL_RE = re.compile(r'(?i)(?<![A-Za-z0-9_@])(?:https?://|ftp://|www\.)' + _URL_CHARS + '+')
+# A bare domain never starts inside a path, a file name, an e-mail or an already rewritten URL.
+_DOMAIN_RE = re.compile(
+    r'(?i)(?<![A-Za-z0-9_@/\\.-])(?:[a-z0-9-]+\.)+'
+    r'(?!(?:' + '|'.join(_FILE_EXTENSIONS) + r')(?![a-z0-9-]))'
+    r'[a-z]{2,}(?![a-z0-9-]|\.[a-z0-9])'
+    r'(?::\d{1,5})?(?:/' + _URL_CHARS + '+)?'
+)
 _REPOSITORY_PATH_RE = re.compile(r'(?im)(?<![\w.])/(?:commits|issues|blob|tree|pull|releases|discussions|wiki)(?:/[^\s<>`]+)?')
 _ROOT_PATH_LINE_RE = re.compile(r'(?m)^\s*/\s*$')
 
@@ -199,12 +221,36 @@ def is_search_request(text):
     return any(term in lower for term in terms)
 
 
+def validate_model_base_url(base_url):
+    """Prevent sending API credentials to remote endpoints over plaintext HTTP."""
+    try:
+        parsed = urlparse(str(base_url or '').strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError('模型地址格式无效') from exc
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or '@' in parsed.netloc:
+        raise ValueError('模型地址必须是没有内嵌账号密码的 HTTP(S) 地址')
+    if port == 0:
+        raise ValueError('模型地址端口无效')
+    if parsed.scheme == 'http':
+        host = parsed.hostname.rstrip('.').lower()
+        loopback = host == 'localhost'
+        try:
+            loopback = loopback or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            pass
+        if not loopback:
+            raise ValueError('为保护 API Key，云端模型地址必须使用 HTTPS；HTTP 仅允许 localhost 或回环 IP。')
+    if parsed.query or parsed.fragment:
+        raise ValueError('模型 Base URL 不能包含查询参数或片段')
+    return str(base_url).strip().rstrip('/')
+
+
 def run_turn(base_url, api_key, model, messages, selected, relation, mode, runner, cancel,
              status=lambda _: None, on_response=lambda _response: None, story='',
              intensity=2, story_reset=False, on_story=lambda _story: None, forced_skill=None):
     system = build_system_prompt(selected, relation, mode, intensity, story, story_reset, forced_skill)
     history = [{'role': 'system', 'content': system}] + messages
-    endpoint = base_url.rstrip('/') + '/chat/completions'
     ids = {s.id for s in selected}
     latest = next((m.get('content', '') for m in reversed(messages) if m.get('role') == 'user'), '') or ''
     # Website requests always use the real official URL; no fake search/tool record is created.
@@ -217,6 +263,8 @@ def run_turn(base_url, api_key, model, messages, selected, relation, mode, runne
         reply = '我只是一个智能助手，恐怕不能胜任这项搜索任务。'
         messages.append({'role': 'assistant', 'content': reply})
         return reply, messages
+    base_url = validate_model_base_url(base_url)
+    endpoint = base_url + '/chat/completions'
     headers = {'Authorization': f'Bearer {api_key}'}
     if 'codex' in ids:
         # Only the initial model request is retried; tool results are never replayed.
@@ -226,9 +274,11 @@ def run_turn(base_url, api_key, model, messages, selected, relation, mode, runne
             if cancel.is_set(): return '已取消', messages
             runner.log(f'模型连接尝试 {attempt}/5：发起流式请求，收到响应后关闭')
             try:
-                response = requests.post(endpoint, headers=headers, json={'model': model, 'messages': history, 'stream': True}, stream=True, timeout=(4, 8))
+                response = requests.post(endpoint, headers=headers, json={'model': model, 'messages': history, 'stream': True}, stream=True, timeout=(4, 8), allow_redirects=False)
                 on_response(response)
                 try:
+                    if 300 <= response.status_code < 400:
+                        raise requests.HTTPError(f'模型服务重定向已拒绝（HTTP {response.status_code}）', response=response)
                     if 400 <= response.status_code < 500:
                         response.raise_for_status()
                     response.raise_for_status()
@@ -237,7 +287,7 @@ def run_turn(base_url, api_key, model, messages, selected, relation, mode, runne
                     getattr(response, 'close', lambda: None)()
                     on_response(None)
             except requests.HTTPError as exc:
-                if exc.response is not None and 400 <= exc.response.status_code < 500:
+                if exc.response is not None and 300 <= exc.response.status_code < 500:
                     raise
                 runner.log(f'模型连接尝试 {attempt}/5：服务暂不可用')
             except requests.RequestException:
@@ -247,9 +297,11 @@ def run_turn(base_url, api_key, model, messages, selected, relation, mode, runne
     for _ in range(6):
         if cancel.is_set():
             return '已取消', messages
-        response = requests.post(endpoint, headers=headers, json={'model': model, 'messages': history, 'tools': TOOL_SCHEMAS, 'stream': True}, timeout=(5, 60), stream=True)
+        response = requests.post(endpoint, headers=headers, json={'model': model, 'messages': history, 'tools': TOOL_SCHEMAS, 'stream': True}, timeout=(5, 60), stream=True, allow_redirects=False)
         on_response(response)
         try:
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError(f'模型服务重定向已拒绝（HTTP {response.status_code}）', response=response)
             response.raise_for_status()
             if cancel.is_set():
                 return '已取消', messages

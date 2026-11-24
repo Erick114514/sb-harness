@@ -18,6 +18,8 @@ py -m venv .venv
 
 在设置中填写服务商的 API Base URL、模型 ID 和 API Key。支持兼容 OpenAI Chat Completions 的服务，例如 DeepSeek、Gemini 兼容端点及 OpenAI API。密钥存于当前 Windows 用户的 Credential Manager；模型服务商会收到本次请求所需的聊天上下文、剧情摘要和工具结果。
 
+界面有五种风格，在「设置 › 外观」里切换，选择会保存：奶蛙（深色）、冰箱（浅色搪瓷）、公文（工具调用编号、审批盖章）、蓝屏（PowerShell 终端，没有侧栏）、脚注（阅读优先，工具调用写成脚注）。快捷键：Ctrl+N 新对话，Ctrl+K 切换对话与项目，Esc 停止当前任务或返回聊天。
+
 ## 三只门把手
 
 权限菜单决定工具什么时候可以通过：
