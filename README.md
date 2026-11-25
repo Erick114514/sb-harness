@@ -68,7 +68,7 @@ py -m PyInstaller --noconfirm --clean SBHarness-build.spec
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SBHarness.iss
 ```
 
-PyInstaller 输出为 `dist\SBHarness-Standalone.exe`；安装包还需要 Inno Setup 6 的命令行编译器 ISCC，输出为 `dist\SBHarness-Setup-v0.1.1.exe`。项目的 PyInstaller spec 包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。公开版 Release 同时提供安装程序与便携版；安装程序按当前 Windows 用户安装，不需要管理员权限，不会在卸载时删除用户资料。
+PyInstaller 输出为 `dist\SBHarness-Standalone.exe`；安装包还需要 Inno Setup 6 的命令行编译器 ISCC，输出为 `dist\SBHarness-Setup-v0.1.2.exe`。项目的 PyInstaller spec 包含应用图标与素材，并排除与 Qt 冲突的第三方 ICU DLL。公开版 Release 同时提供安装程序与便携版；安装程序按当前 Windows 用户安装，不需要管理员权限，不会在卸载时删除用户资料。
 
 ## 许可证
 

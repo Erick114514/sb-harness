@@ -1,5 +1,5 @@
 #define MyAppName "SB Harness"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "Erick114514"
 #define MyAppExeName "SBHarness-Standalone.exe"
 #define RepoRoot SourcePath + "..\"
