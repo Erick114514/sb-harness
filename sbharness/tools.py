@@ -252,7 +252,20 @@ class ToolRunner:
             return f'读取完成；正文已隐藏（{len(result)} 字符）' if status == 'done' else redact(result)[:4000]
         return redact(result)[:4000]
 
+    @staticmethod
+    def _reject_network_path(raw):
+        """Refuse UNC, device and NT-namespace paths before anything touches the file system.
+
+        Merely resolving such a path makes Windows contact the named host and offer the
+        user's NTLM credentials, so this runs before resolve(), exists() and any approval.
+        """
+        if not isinstance(raw, str):
+            raise ValueError('路径必须是字符串')
+        if raw.strip().replace('/', '\\').startswith(('\\\\', '\\??\\')):
+            raise ValueError('不支持网络路径（UNC）或设备路径')
+
     def path(self, raw):
+        self._reject_network_path(raw)
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate

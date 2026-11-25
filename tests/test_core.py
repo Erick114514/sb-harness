@@ -7,6 +7,7 @@ import time
 import sys
 import socket
 import unittest
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -186,6 +187,38 @@ class CoreTests(unittest.TestCase):
             denied = ToolRunner(tmp, lambda _: False, lambda _: None, threading.Event(), permission_mode='approve_safe')
             self.assertIn('拒绝', denied.execute('write_file', {'path':'denied/nested/file.txt', 'content':'blocked'}))
             self.assertFalse((Path(tmp) / 'denied').exists())
+
+    def test_network_paths_are_refused_before_any_file_system_access(self):
+        if os.name != 'nt':
+            self.skipTest('Windows UNC semantics')
+        import ntpath
+        touched = []
+
+        def guard(real):
+            def wrapper(path, *args, **kwargs):
+                if os.fspath(path).replace('/', '\\').startswith('\\\\'):
+                    touched.append(os.fspath(path))
+                    raise OSError(0, 'network access blocked in test', os.fspath(path), 67)
+                return real(path, *args, **kwargs)
+            return wrapper
+
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            for name in ('_getfinalpathname', '_nt_readlink'):
+                if hasattr(ntpath, name):
+                    stack.enter_context(patch.object(ntpath, name, guard(getattr(ntpath, name))))
+            stack.enter_context(patch('os.stat', guard(os.stat)))
+            approvals = []
+            # Denying keeps a regressed build away from the real CreateFileW call as well.
+            runner = ToolRunner(tmp, lambda detail: approvals.append(detail) or False, lambda _: None,
+                                threading.Event(), permission_mode='ask')
+            for name, path in (('read_file', r'\\203.0.113.7\share\notes.txt'),
+                               ('write_file', '//203.0.113.7/share/notes.txt'),
+                               ('make_pdf', r'\\?\UNC\203.0.113.7\share\report.pdf'),
+                               ('read_file', r'\\.\pipe\sbharness')):
+                with self.subTest(tool=name, path=path):
+                    self.assertIn('不支持网络路径', runner.execute(name, {'path': path, 'content': 'x'}))
+        self.assertEqual(touched, [])
+        self.assertEqual(approvals, [])
 
     def test_checked_file_handles_block_parent_and_file_renames(self):
         if os.name != 'nt':

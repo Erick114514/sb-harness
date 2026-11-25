@@ -7,10 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtCore import QEvent, QPoint, Qt, QSettings
-from PySide6.QtGui import QInputMethodEvent, QKeyEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QPoint, Qt, QSettings, QUrl
+from PySide6.QtGui import QImage, QInputMethodEvent, QKeyEvent
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QTextBrowser
 import sbharness.__main__ as desktop
+import sbharness.chatview as chatview
 from sbharness.skills import BUILTINS, Skill
 
 
@@ -469,6 +471,62 @@ class StyleTests(WindowTestCase):
         self.assertEqual(window.behavior_button.text(), '纯种 SB')
         self.assertEqual(window.settings.value('mode'), '纯种 SB')
         self.assertEqual(int(window.settings.value('intensity')), 1)
+
+
+class UntrustedContentTests(WindowTestCase):
+    """Model output and tool arguments are data: no HTML, no fetched images, no shell links."""
+
+    def test_tool_cards_and_log_show_markup_as_literal_text(self):
+        window = self.open_window()
+        window.resize(1180, 760)
+        window.show()
+        payload = '<img src=missing-audit.png>'
+        window._tool_event({'call_id': 'm1', 'name': payload, 'args': {'path': payload}, 'status': 'running'})
+        self.settle()
+        row = window.chat.cards['m1']
+        for label in (row.action, row.subject, row.status_label):
+            self.assertEqual(label.textFormat(), Qt.PlainText)
+        self.assertEqual(row.subject.text(), payload)
+        self.assertNotIn('<img', row.line.toolTip())
+        self.assertNotIn('<img', row.subject.toolTip())
+        self.assertIsInstance(window.log, desktop.QPlainTextEdit)
+
+    def test_chat_images_become_alt_text_and_are_never_loaded(self):
+        loads = []
+
+        class RecordingBrowser(QTextBrowser):
+            def loadResource(self, kind, url):
+                loads.append(url.toString())
+                return QImage(1, 1, QImage.Format_ARGB32)
+
+        window = self.open_window()
+        with patch.object(chatview, 'QTextBrowser', RecordingBrowser):
+            window.add_message('assistant', '报告如下：\n\n![图表](missing-audit.png)')
+        window.show()
+        self.settle()
+        bubble = window.chat.entries[-1].findChild(desktop.MessageBubble)
+        self.assertEqual(loads, [])
+        self.assertTrue(bubble.browser.document().find('\ufffc').isNull())
+        self.assertIn('[图片：图表]', bubble.plain_text())
+
+    def test_chat_links_only_open_https(self):
+        window = self.open_window()
+        window.resize(1000, 700)
+        window.show()
+        window.add_message('assistant', '[查看报告](search-ms:query=report)')
+        window.add_message('assistant', '[官网](https://example.com/)')
+        self.settle()
+        risky, web = (entry.findChild(desktop.MessageBubble) for entry in window.chat.entries[-2:])
+        self.assertFalse(risky.browser.openLinks())
+        with patch.object(chatview, 'QDesktopServices') as services:
+            for bubble in (risky, web):
+                QTest.mouseClick(bubble.browser.viewport(), Qt.LeftButton, Qt.NoModifier, QPoint(8, 8))
+                self.settle()
+            for target in ('C:/Windows/System32/calc.exe', 'file:///C:/Windows/win.ini', 'http://example.com/'):
+                risky.browser.anchorClicked.emit(QUrl(target))
+        opened = [call.args[0].toString() for call in services.openUrl.call_args_list]
+        self.assertEqual(opened, ['https://ys.mihoyo.com/'])
+        self.assertIn('查看报告', risky.plain_text())
 
 
 if __name__ == '__main__': unittest.main()

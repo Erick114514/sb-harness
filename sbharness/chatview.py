@@ -5,13 +5,15 @@ same timeline but a different presentation.
 """
 from __future__ import annotations
 
+import html
 import json
 import uuid
 
+from PySide6 import QtGui
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-    QTextBlockFormat, QTextCursor, QTextDocument,
+    QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+    QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat,
 )
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QStyle,
@@ -46,6 +48,36 @@ def chinese_number(number: int) -> str:
         tens, ones = divmod(number, 10)
         return ("" if tens == 1 else _DIGITS[tens]) + "十" + (_DIGITS[ones] if ones else "")
     return str(number)
+
+
+def literal_tooltip(text) -> str:
+    """Qt renders a tooltip as HTML when its first line looks like markup; escape such text so
+    tool arguments always show literally and can never load an image (file:// or UNC)."""
+    text = str(text or "")
+    if QtGui.Qt.mightBeRichText(text):
+        return "<p style='white-space:pre-wrap'>" + html.escape(text, quote=False) + "</p>"
+    return text
+
+
+def open_web_link(url):
+    """Only https links leave the app. Any other target (file:, UNC, search-ms:, a drive path)
+    would be handed to the Windows shell, so it is ignored."""
+    if url.scheme().lower() == "https" and url.host():
+        QDesktopServices.openUrl(url)
+
+
+def strip_images(document):
+    """Swap every image for its alt text before the first layout: Qt opens file:// and UNC
+    image paths by itself, and Windows then offers the user's NTLM credentials to that host."""
+    cursor = QTextCursor(document)
+    while True:
+        cursor = document.find(chr(0xFFFC), cursor)  # QChar::ObjectReplacementCharacter
+        if cursor.isNull():
+            return
+        image = cursor.charFormat()
+        if image.isImageFormat():
+            alt = image.stringProperty(QTextFormat.Property.ImageAltText).strip()
+            cursor.insertText(f"[图片：{alt}]" if alt else "[图片]", QTextCharFormat())
 
 
 def repolish(widget):
@@ -177,11 +209,13 @@ class ElidedLabel(QLabel):
         super().__init__(parent)
         self._full_text = ""
         self._mode = mode
+        # Titles, paths and tool arguments are data: never interpret them as HTML.
+        self.setTextFormat(Qt.PlainText)
         self.setText(text)
 
     def setText(self, text):
         self._full_text = str(text or "")
-        self.setToolTip(self._full_text)
+        self.setToolTip(literal_tooltip(self._full_text))
         self.updateGeometry()
         self._apply_elision()
 
@@ -293,7 +327,9 @@ class MessageBubble(QFrame):
         self.prompt_mark.setVisible(self.prompt)
         row.addWidget(self.prompt_mark, 0, Qt.AlignTop)
         self.browser = QTextBrowser()
-        self.browser.setOpenExternalLinks(True)
+        # Links never open by themselves (no setSource, no shell); only https gets through.
+        self.browser.setOpenLinks(False)
+        self.browser.anchorClicked.connect(open_web_link)
         self.browser.setFrameShape(QFrame.NoFrame)
         self.browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -309,6 +345,7 @@ class MessageBubble(QFrame):
         document.setDocumentMargin(0)
         # Do not let model-provided raw HTML become an active embedded object.
         document.setMarkdown(content.replace("<", "&lt;").replace(">", "&gt;"))
+        strip_images(document)
         self._set_line_height(document, theme.prose_line_height if role == "assistant" else 140)
         document.setTextWidth(-1)
         self._ideal_width = int(document.idealWidth() + 1)
@@ -662,10 +699,13 @@ class ToolRow(QFrame):
         self.number.setVisible(numbered)
         self.action = QLabel()
         self.action.setObjectName("toolAction")
+        # The tool name comes from the model; an unknown one is shown as given.
+        self.action.setTextFormat(Qt.PlainText)
         self.subject = ElidedLabel(mode=Qt.ElideMiddle)
         self.subject.setObjectName("toolSubject")
         self.status_label = QLabel()
         self.status_label.setObjectName("toolStatus")
+        self.status_label.setTextFormat(Qt.PlainText)
         self.stamp = StampBadge(self.theme, diameter=30) if self.kind == "exhibit" else None
         self.chevron = QLabel()
         self.chevron.setFixedSize(16, 16)
@@ -720,7 +760,7 @@ class ToolRow(QFrame):
         self.status_label.setProperty("tone", STATUS_TONE.get(self._status_key, "muted"))
         repolish(self.status_label)
         self.marker.set_status(self._status_key)
-        self.line.setToolTip(self._title)
+        self.line.setToolTip(literal_tooltip(self._title))
         decision = merged.get("approval")
         if self.stamp is not None and decision in ("approved", "denied"):
             self.stamp.set_state(decision)

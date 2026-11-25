@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -1118,7 +1118,8 @@ class Window(QMainWindow):
         log_title = QLabel("最近工具记录")
         log_title.setObjectName("sectionLabel")
         layout.addWidget(log_title)
-        self.log = QTextEdit()
+        # Log lines carry tool arguments and results, so they are shown as plain text, never HTML.
+        self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(180)
         layout.addWidget(self.log)
@@ -1814,7 +1815,7 @@ class Window(QMainWindow):
         self.worker = Worker(config, list(self.messages), selected, relation, self.wallet)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.log.connect(self.log.append)
+        self.worker.log.connect(self.log.appendPlainText)
         self.worker.approval.connect(self.request_approval)
         self.worker.status.connect(self._set_status)
         self.worker.appeal.connect(self._set_appeal_visible)
@@ -1892,7 +1893,7 @@ class Window(QMainWindow):
             self.new_chat()
 
     def trigger_ban(self, source, reason):
-        self.log.append(f"本地封号演出触发：{source}（仅影响本应用）。")
+        self.log.appendPlainText(f"本地封号演出触发：{source}（仅影响本应用）。")
         screen = self.screen()
         self.ban_overlay.show_blocked(reason, screen)
 
@@ -1948,7 +1949,7 @@ class Window(QMainWindow):
             if self.approval_dialog is not None:
                 self._resolve_approval(False, cancelled=True)
             self._set_status("正在停止…")
-            self.log.append("已请求取消。正在等待当前网络或命令操作安全结束。")
+            self.log.appendPlainText("已请求取消。正在等待当前网络或命令操作安全结束。")
 
     def closeEvent(self, event):
         if self.thread and not self.allow_exit:
